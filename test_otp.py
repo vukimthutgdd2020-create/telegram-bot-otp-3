@@ -718,7 +718,7 @@ async def otp_list_callback(c: CallbackQuery):
         btns.append([InlineKeyboardButton(text="⬅️ Quay lại", callback_data="menu")])
 
         await c.message.edit_text(
-            "<b>Chọn dịch vụ OTP\n CHỈ BẢO HÀNH MÃ KHÔNG VỀ HOÀN TIỀN</b>",
+            "<b>Chọn dịch vụ OTP\nCHỈ BẢO HÀNH MÃ KHÔNG VỀ HOÀN TIỀN</b>",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=btns)
         )
     else:
