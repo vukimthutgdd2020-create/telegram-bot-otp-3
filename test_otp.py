@@ -361,7 +361,7 @@ async def refresh_bal(c: CallbackQuery):
 @dp.callback_query(F.data == "contact")
 async def contact_callback(c: CallbackQuery):
     await c.answer()
-    await c.message.answer("☎️ Hỗ trợ: liên hệ admin của bot.")
+    await c.message.answer("☎️ Hỗ trợ: liên hệ admin của bot: @tai_khoan_xin")
 
 # --- ADMIN HANDLERS (users, thongbao, sodu, khachdangdu, setnote, delnote, notes) ---
 @dp.message(Command("users"))
