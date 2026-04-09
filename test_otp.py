@@ -45,7 +45,7 @@ HTTP_CLIENT = httpx.AsyncClient(
     limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
     follow_redirects=True
 )
-
+BALANCE_LOCK = asyncio.Lock()
 DEFAULT_NOTE = "📌 Ghi chú: OTP về sẽ tính tiền. Nếu sau thời gian chờ không có OTP thì hệ thống sẽ hoàn tiền."
 QR_TEMPLATE_PATH = BASE_DIR / "qr_mau_nguoi_cam_giay.jpg"
 
@@ -93,8 +93,11 @@ class DepositState(StatesGroup):
 
 # --- DATABASE ---
 def db():
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_NAME, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 def init_db():
@@ -121,7 +124,16 @@ def init_db():
     columns = [column[1] for column in cur.fetchall()]
     if 'balance' not in columns:
         cur.execute("ALTER TABLE users ADD COLUMN balance INTEGER DEFAULT 0")
-
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS balance_logs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            change_amount INTEGER NOT NULL,
+            balance_after INTEGER NOT NULL,
+            note TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -131,42 +143,97 @@ def get_user(user_id):
     conn.close()
     return user
 
-def update_balance(user_id, amount, full_name=None, username=None):
+def get_balance(user_id):
+    conn = db()
+    try:
+        row = conn.execute(
+            "SELECT balance FROM users WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
+        return int(row["balance"]) if row else 0
+    finally:
+        conn.close()
+
+
+def update_balance(user_id, amount, full_name=None, username=None, note=""):
     conn = db()
     cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO users (user_id, full_name, username, balance)
+            VALUES (?, ?, ?, 0)
+            ON CONFLICT(user_id) DO UPDATE SET
+                full_name = COALESCE(excluded.full_name, users.full_name),
+                username = COALESCE(excluded.username, users.username)
+        """, (user_id, full_name, username))
 
-    cur.execute("""
-        INSERT OR IGNORE INTO users (user_id, full_name, username, balance)
-        VALUES (?, ?, ?, 0)
-    """, (user_id, full_name, username))
+        cur.execute("""
+            UPDATE users
+            SET balance = balance + ?
+            WHERE user_id = ?
+        """, (amount, user_id))
 
-    cur.execute(
-        "UPDATE users SET balance = balance + ? WHERE user_id = ?",
-        (amount, user_id)
-    )
-    conn.commit()
+        cur.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+        row = cur.fetchone()
+        new_balance = int(row["balance"]) if row else None
 
-    ok = cur.rowcount > 0
-    conn.close()
-    return ok
-def set_balance(user_id, new_balance, full_name=None, username=None):
+        if new_balance is not None:
+            cur.execute("""
+                INSERT INTO balance_logs(user_id, change_amount, balance_after, note)
+                VALUES (?, ?, ?, ?)
+            """, (user_id, amount, new_balance, note))
+
+        conn.commit()
+        return new_balance
+    except Exception:
+        conn.rollback()
+        logging.exception("Lỗi update_balance")
+        return None
+    finally:
+        conn.close()
+
+
+def set_balance(user_id, new_balance, full_name=None, username=None, note=""):
     conn = db()
     cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO users (user_id, full_name, username, balance)
+            VALUES (?, ?, ?, 0)
+            ON CONFLICT(user_id) DO UPDATE SET
+                full_name = COALESCE(excluded.full_name, users.full_name),
+                username = COALESCE(excluded.username, users.username)
+        """, (user_id, full_name, username))
 
-    cur.execute("""
-        INSERT OR IGNORE INTO users (user_id, full_name, username, balance)
-        VALUES (?, ?, ?, 0)
-    """, (user_id, full_name, username))
+        cur.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+        old_row = cur.fetchone()
+        old_balance = int(old_row["balance"]) if old_row else 0
 
-    cur.execute(
-        "UPDATE users SET balance = ? WHERE user_id = ?",
-        (new_balance, user_id)
-    )
-    conn.commit()
+        cur.execute("""
+            UPDATE users
+            SET balance = ?
+            WHERE user_id = ?
+        """, (new_balance, user_id))
 
-    ok = cur.rowcount > 0
-    conn.close()
-    return ok
+        cur.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+        row = cur.fetchone()
+        final_balance = int(row["balance"]) if row else None
+
+        if final_balance is not None:
+            change_amount = final_balance - old_balance
+            cur.execute("""
+                INSERT INTO balance_logs(user_id, change_amount, balance_after, note)
+                VALUES (?, ?, ?, ?)
+            """, (user_id, change_amount, final_balance, note))
+
+        conn.commit()
+        return final_balance
+    except Exception:
+        conn.rollback()
+        logging.exception("Lỗi set_balance")
+        return None
+    finally:
+        conn.close()
 
 def save_user(user):
     conn = db()
@@ -447,12 +514,23 @@ async def admin_broadcast(m: Message):
 
 @dp.message(Command("sodu"))
 async def admin_check_one_balance(m: Message):
-    if m.from_user.id != ADMIN_ID: return await m.answer("❌ Bạn không có quyền!")
+    if m.from_user.id != ADMIN_ID:
+        return await m.answer("❌ Bạn không có quyền!")
     parts = m.text.split()
-    if len(parts) < 2: return await m.answer("Sử dụng: /sodu [user_id]")
-    user = get_user(parts[1])
-    if not user: return await m.answer("Không tìm thấy.")
-    await m.answer(f"👤 {user['full_name']}\n💰 Số dư: <b>{user['balance']:,}đ</b>")
+    if len(parts) < 2:
+        return await m.answer("Sử dụng: /sodu [user_id]")
+
+    try:
+        user_id = int(parts[1])
+    except:
+        return await m.answer("❌ user_id phải là số.")
+
+    user = get_user(user_id)
+    if not user:
+        return await m.answer("Không tìm thấy.")
+
+    balance = get_balance(user_id)
+    await m.answer(f"👤 {user['full_name']}\n💰 Số dư: <b>{balance:,}đ</b>")
 
 @dp.message(Command("khachdangdu"))
 async def admin_list_positive_balance(m: Message):
@@ -506,23 +584,26 @@ async def admin_add_balance(m: Message):
     if amount <= 0:
         return await m.answer("❌ Số tiền phải lớn hơn 0.")
 
-    ok = update_balance(user_id, amount)
-    if not ok:
-        return await m.answer("❌ Không cộng được số dư.")
+    async with BALANCE_LOCK:
+        new_balance = update_balance(
+            user_id,
+            amount,
+            note=f"Admin cộng tiền bởi {m.from_user.id}"
+        )
 
-    user = get_user(user_id)
-    balance = user["balance"] if user else 0
+    if new_balance is None:
+        return await m.answer("❌ Không cộng được số dư.")
 
     await m.answer(
         f"✅ Đã cộng <b>{amount:,}đ</b> cho user <code>{user_id}</code>\n"
-        f"💰 Số dư mới: <b>{balance:,}đ</b>"
+        f"💰 Số dư mới: <b>{new_balance:,}đ</b>"
     )
 
     try:
         await bot.send_message(
             user_id,
             f"💰 Admin vừa cộng thêm <b>{amount:,}đ</b> cho bạn.\n"
-            f"💳 Số dư hiện tại: <b>{balance:,}đ</b>"
+            f"💳 Số dư hiện tại: <b>{new_balance:,}đ</b>"
         )
     except:
         logging.exception("Không gửi được thông báo cộng tiền cho khách")
@@ -544,33 +625,32 @@ async def admin_sub_balance(m: Message):
     if amount <= 0:
         return await m.answer("❌ Số tiền phải lớn hơn 0.")
 
-    user = get_user(user_id)
-    if not user:
-        return await m.answer("❌ Không tìm thấy user.")
+    async with BALANCE_LOCK:
+        current_balance = get_balance(user_id)
+        if amount > current_balance:
+            return await m.answer(
+                f"❌ Không thể trừ {amount:,}đ vì khách chỉ còn {current_balance:,}đ."
+            )
 
-    current_balance = int(user["balance"])
-    if amount > current_balance:
-        return await m.answer(
-            f"❌ Không thể trừ {amount:,}đ vì khách chỉ còn {current_balance:,}đ."
+        new_balance = update_balance(
+            user_id,
+            -amount,
+            note=f"Admin trừ tiền bởi {m.from_user.id}"
         )
 
-    ok = update_balance(user_id, -amount)
-    if not ok:
+    if new_balance is None:
         return await m.answer("❌ Không trừ được số dư.")
-
-    user = get_user(user_id)
-    balance = user["balance"] if user else 0
 
     await m.answer(
         f"✅ Đã trừ <b>{amount:,}đ</b> của user <code>{user_id}</code>\n"
-        f"💰 Số dư mới: <b>{balance:,}đ</b>"
+        f"💰 Số dư mới: <b>{new_balance:,}đ</b>"
     )
 
     try:
         await bot.send_message(
             user_id,
             f"💸 Admin vừa trừ <b>{amount:,}đ</b> khỏi số dư của bạn.\n"
-            f"💳 Số dư hiện tại: <b>{balance:,}đ</b>"
+            f"💳 Số dư hiện tại: <b>{new_balance:,}đ</b>"
         )
     except:
         logging.exception("Không gửi được thông báo trừ tiền cho khách")
@@ -585,29 +665,32 @@ async def admin_set_user_balance(m: Message):
 
     try:
         user_id = int(parts[1])
-        new_balance = int(parts[2])
+        new_balance_input = int(parts[2])
     except:
         return await m.answer("❌ User ID và số dư phải là số.")
 
-    if new_balance < 0:
+    if new_balance_input < 0:
         return await m.answer("❌ Số dư không được âm.")
 
-    ok = set_balance(user_id, new_balance)
-    if not ok:
+    async with BALANCE_LOCK:
+        final_balance = set_balance(
+            user_id,
+            new_balance_input,
+            note=f"Admin đặt số dư bởi {m.from_user.id}"
+        )
+
+    if final_balance is None:
         return await m.answer("❌ Không đặt được số dư.")
 
-    user = get_user(user_id)
-    balance = user["balance"] if user else 0
-
     await m.answer(
-        f"✅ Đã đặt số dư user <code>{user_id}</code> thành <b>{balance:,}đ</b>"
+        f"✅ Đã đặt số dư user <code>{user_id}</code> thành <b>{final_balance:,}đ</b>"
     )
 
     try:
         await bot.send_message(
             user_id,
             f"💳 Admin vừa cập nhật số dư của bạn.\n"
-            f"💰 Số dư hiện tại: <b>{balance:,}đ</b>"
+            f"💰 Số dư hiện tại: <b>{final_balance:,}đ</b>"
         )
     except:
         logging.exception("Không gửi được thông báo set số dư cho khách")
@@ -705,16 +788,18 @@ async def admin_action_handler(c: CallbackQuery):
         user_id = int(parts[1])
         amount = int(parts[2])
 
-        ok = update_balance(user_id, amount)
+        async with BALANCE_LOCK:
+            new_balance = update_balance(
+                user_id,
+                amount,
+                note=f"Duyệt nạp tiền {amount}đ bởi admin {c.from_user.id}"
+            )
 
-        if not ok:
+        if new_balance is None:
             await c.message.edit_text(
                 c.message.text + f"\n\n❌ Duyệt thất bại: không cộng được tiền cho khách."
             )
             return await c.answer("Không cộng được tiền!", show_alert=True)
-
-        user = get_user(user_id)
-        new_balance = user["balance"] if user else 0
 
         try:
             await bot.send_message(
@@ -820,7 +905,17 @@ async def otp_buy_callback(c: CallbackQuery):
     res = await otp_api.request_number(app_id, carrier=carrier)
 
     if res.get("ResponseCode") == 0:
-        if user_id != ADMIN_ID: update_balance(user_id, -sell_price)
+        if user_id != ADMIN_ID:
+            async with BALANCE_LOCK:
+                new_balance = update_balance(
+                    user_id,
+                    -sell_price,
+                    full_name=c.from_user.full_name,
+                    username=c.from_user.username,
+                    note=f"Mua số OTP app {app_name}"
+                )
+            if new_balance is None:
+                return await c.message.edit_text("❌ Trừ tiền thất bại, vui lòng thử lại.")
         phone = res["Result"]["Number"]
         req_id = res["Result"]["Id"]
         display_phone = normalize_phone_vn(phone)
@@ -900,7 +995,16 @@ async def buy_back_number(m: Message):
         req_id = res["Result"]["Id"]
 
         if not is_admin:
-            update_balance(user_id, -sell_price)
+            async with BALANCE_LOCK:
+                new_balance = update_balance(
+                    user_id,
+                    -sell_price,
+                    full_name=m.from_user.full_name,
+                    username=m.from_user.username,
+                    note=f"Mua lại số cũ app {app_name} - {phone_number}"
+                )
+            if new_balance is None:
+                return await m.answer("❌ Trừ tiền thất bại, vui lòng thử lại.")
 
         await m.answer(
             f"✅ Đã kết nối lại số <code>{phone_number}</code>\n"
@@ -930,8 +1034,24 @@ async def wait_for_otp(user_id, req_id, phone, sell_price, is_admin, app_name):
         elif res.get("ResponseCode") == 2: break
     
     if not is_admin:
-        update_balance(user_id, sell_price)
-        await bot.send_message(user_id, f"❌ Hết hạn số <code>{phone}</code>. Đã hoàn <b>{sell_price:,}đ</b>.")
+        async with BALANCE_LOCK:
+            new_balance = update_balance(
+                user_id,
+                sell_price,
+                note=f"Hoàn tiền OTP hết hạn app {app_name} - {phone}"
+            )
+
+        if new_balance is not None:
+            await bot.send_message(
+                user_id,
+                f"❌ Hết hạn số <code>{phone}</code>. Đã hoàn <b>{sell_price:,}đ</b>.\n"
+                f"💰 Số dư mới: <b>{new_balance:,}đ</b>"
+            )
+        else:
+            await bot.send_message(
+                user_id,
+                f"❌ Hết hạn số <code>{phone}</code> nhưng hoàn tiền lỗi, vui lòng liên hệ admin."
+            )
     else:
         await bot.send_message(user_id, f"❌ Hết hạn số <code>{phone}</code> (Admin).")
 
