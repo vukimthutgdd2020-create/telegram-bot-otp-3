@@ -2,6 +2,7 @@ import asyncio
 import logging
 import sqlite3
 import html
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 from io import BytesIO
@@ -19,7 +20,8 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
-    BufferedInputFile
+    BufferedInputFile,
+    FSInputFile
 )
 
 # --- CẤU HÌNH ---
@@ -351,7 +353,25 @@ async def show_menu(m: Message):
         f"👋 Chào <b>{m.from_user.full_name}</b>!",
         reply_markup=main_menu_keyboard(m.from_user.id)
     )
-
+@dp.message(Command("help"))
+async def help_command(m: Message):
+    await m.answer(
+        "<b>📖 Danh sách lệnh</b>\n\n"
+        "/start - Mở menu\n"
+        "/help - Xem lệnh\n"
+        "/users - Xem danh sách user (admin)\n"
+        "/thongbao [nội dung] - Gửi thông báo (admin)\n"
+        "/sodu [user_id] - Xem số dư 1 user (admin)\n"
+        "/khachdangdu - Xem khách còn dư tiền (admin)\n"
+        "/congtien [user_id] [số_tiền] - Cộng tiền (admin)\n"
+        "/trutien [user_id] [số_tiền] - Trừ tiền (admin)\n"
+        "/setsodu [user_id] [số_dư_mới] - Đặt số dư (admin)\n"
+        "/setnote app | nội dung - Ghi chú app (admin)\n"
+        "/delnote keyword - Xóa ghi chú app (admin)\n"
+        "/notes - Xem tất cả ghi chú (admin)\n"
+        "/mualai [ID_App] [Số_điện_thoại] - Mua lại số cũ\n"
+        "/backup - Gửi file shop_bot.db về admin (admin)\n"
+    )
 @dp.callback_query(F.data == "refresh_bal")
 async def refresh_bal(c: CallbackQuery):
     save_user(c.from_user)
@@ -373,7 +393,43 @@ async def admin_list_users(m: Message):
     for i, u in enumerate(users, 1):
         lines.append(f"{i}. {u['full_name']} (ID: <code>{u['user_id']}</code>) - <b>{u['balance']:,}đ</b>")
     await m.answer("\n".join(lines))
+@dp.message(Command("backup"))
+async def admin_backup_db(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return await m.answer("❌ Bạn không có quyền!")
 
+    db_path = Path(DB_NAME)
+
+    if not db_path.exists():
+        return await m.answer(
+            "❌ Không tìm thấy file database.\n"
+            f"📂 Đường dẫn hiện tại: <code>{html.escape(str(db_path))}</code>"
+        )
+
+    try:
+        file_size = db_path.stat().st_size
+        time_text = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        backup_file = FSInputFile(str(db_path))
+
+        await bot.send_document(
+            chat_id=ADMIN_ID,
+            document=backup_file,
+            caption=(
+                "✅ <b>BACKUP DATABASE THÀNH CÔNG</b>\n\n"
+                f"📁 Tên file: <b>{html.escape(db_path.name)}</b>\n"
+                f"📦 Dung lượng: <b>{file_size:,} bytes</b>\n"
+                f"🕒 Thời gian: <b>{time_text}</b>\n"
+                f"📂 Đường dẫn: <code>{html.escape(str(db_path))}</code>"
+            )
+        )
+
+        await m.answer("✅ Bot đã gửi file shop_bot.db về Telegram admin.")
+    except Exception as e:
+        logging.exception("Lỗi backup database")
+        await m.answer(
+            "❌ Backup thất bại.\n"
+            f"Lỗi: <code>{html.escape(str(e))}</code>"
+        )
 @dp.message(Command("thongbao"))
 async def admin_broadcast(m: Message):
     if m.from_user.id != ADMIN_ID: return await m.answer("❌ Bạn không có quyền!")
